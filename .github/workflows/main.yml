@@ -19,76 +19,64 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
+          # Remove any existing rule with the same name to avoid duplication (SilentlyContinue prevents fail on first run)
           Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
           
           # For testing, allow any incoming connection on port 3389
           New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User
-        env:
-          RDP_USER: ${{ secrets.RDP_USERNAME }}
-          RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+      - name: Create RDP User with Secure Password
         run: |
-          $securePass = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           
-          New-LocalUser -Name $env:RDP_USER -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USER
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          if (-not (Get-LocalUser -Name $env:RDP_USER)) {
+          # Store password as environment variable
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
           }
 
       - name: Install Tailscale
         run: |
-          # Force TLS 1.2 to prevent the "connection was forcibly closed" error
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          # Use Join-Path to prevent any accidental string escaping issues
-          $installerPath = Join-Path -Path $env:TEMP -ChildPath "tailscale.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
           
-          # Add a retry loop for GitHub network blips
-          $maxRetries = 3
-          $retryCount = 0
-          $success = $false
-          
-          while (-not $success -and $retryCount -lt $maxRetries) {
-              try {
-                  Write-Host "Downloading Tailscale... Attempt $($retryCount + 1)"
-                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
-                  $success = $true
-              } catch {
-                  Write-Warning "Download failed: $($_.Exception.Message)"
-                  $retryCount++
-                  if ($retryCount -lt $maxRetries) { Start-Sleep -Seconds 5 }
-              }
-          }
-          
-          if (-not $success) {
-              Write-Error "Failed to download Tailscale after $maxRetries attempts."
-              exit 1
-          }
-          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          $tsExe = Join-Path -Path $env:ProgramFiles -ChildPath "Tailscale\tailscale.exe"
-          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & $tsExe ip -4
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
               $retries++
           }
@@ -111,18 +99,71 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
-        env:
-          RDP_USER: ${{ secrets.RDP_USERNAME }}
+      - name: Maintain Connection & Dashboard
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: [HIDDEN BY GITHUB SECRETS]"
-          Write-Host "==================`n"
+          # Fetch System Hardware Specs
+          $cpu = (Get-CimInstance Win32_Processor).Name
+          $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+          $disk = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'")
+          $freeSpace = [math]::Round($disk.FreeSpace / 1GB, 2)
+          $totalSpace = [math]::Round($disk.Size / 1GB, 2)
           
-          # Keep runner active indefinitely (or until manually cancelled)
+          # Print the Dashboard
+          Write-Host "`n=================================================="
+          Write-Host "🚀 GITHUB RUNNER RDP DASHBOARD"
+          Write-Host "=================================================="
+          Write-Host "🔐 CONNECTION DETAILS"
+          Write-Host "   Address  : $env:TAILSCALE_IP"
+          Write-Host "   Username : RDP"
+          Write-Host "   Password : $env:RDP_PASSWORD"
+          Write-Host "--------------------------------------------------"
+          Write-Host "💻 SYSTEM SPECS"
+          Write-Host "   OS       : Windows Server 2025 Datacenter"
+          Write-Host "   CPU      : $cpu"
+          Write-Host "   RAM      : ${ram} GB"
+          Write-Host "   Storage  : ${freeSpace} GB Free / ${totalSpace} GB Total"
+          Write-Host "--------------------------------------------------"
+          Write-Host "⚠️ LIMIT: Job will forcefully terminate after 6 hours."
+          Write-Host "==================================================`n"
+          
+          # Start Uptime Timer
+          $startTime = Get-Date
+          
+          # Keep runner active and log live telemetry
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              # 1. Time Calculations (UTC & IST)
+              $utcNow = (Get-Date).ToUniversalTime()
+              $istZone = [System.TimeZoneInfo]::FindSystemTimeZoneById("India Standard Time")
+              $istNow = [System.TimeZoneInfo]::ConvertTimeFromUtc($utcNow, $istZone)
+              $utcStr = $utcNow.ToString("HH:mm:ss 'UTC'")
+              $istStr = $istNow.ToString("hh:mm:ss tt 'IST'")
+              
+              # 2. Uptime Calculation
+              $uptime = (Get-Date) - $startTime
+              $uptimeStr = "{0:hh\:mm\:ss}" -f $uptime
+              
+              # 3. Live CPU & RAM Telemetry
+              $cpuLoad = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+              $osInfo = Get-CimInstance Win32_OperatingSystem
+              $freeRam = [math]::Round($osInfo.FreePhysicalMemory / 1MB, 2)
+              $totalRam = [math]::Round($osInfo.TotalVisibleMemorySize / 1MB, 2)
+              $ramUsagePercent = [math]::Round((($totalRam - $freeRam) / $totalRam) * 100, 1)
+              
+              # 4. Network Keep-Alive (Ping Google DNS silently to keep Tailscale tunnel active)
+              Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Quiet | Out-Null
+              
+              # Print the Live Status
+              Write-Host "[⌚ $utcStr | 🌍 $istStr] ⏱️ Uptime: $uptimeStr | 📊 CPU: ${cpuLoad}% | 🧠 RAM Used: ${ramUsagePercent}%"
+              
               Start-Sleep -Seconds 300
+          }
+
+      - name: Cleanup & Disconnect Tailscale
+        if: always()
+        run: |
+          Write-Host "Workflow cancelled or finished. Disconnecting Tailscale..."
+          if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" logout
+          } else {
+              Write-Host "Tailscale is not installed. Skipping cleanup."
           }

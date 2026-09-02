@@ -19,7 +19,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication (SilentlyContinue prevents fail on first run)
+          # Remove any existing rule with the same name to avoid duplication
           Remove-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
           
           # For testing, allow any incoming connection on port 3389
@@ -46,23 +46,49 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          # Force TLS 1.2 to prevent the "connection was forcibly closed" error
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          # Use Join-Path to prevent any accidental string escaping issues
+          $installerPath = Join-Path -Path $env:TEMP -ChildPath "tailscale.msi"
+          
+          # Add a retry loop for GitHub network blips
+          $maxRetries = 3
+          $retryCount = 0
+          $success = $false
+          
+          while (-not $success -and $retryCount -lt $maxRetries) {
+              try {
+                  Write-Host "Downloading Tailscale... Attempt $($retryCount + 1)"
+                  Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -ErrorAction Stop
+                  $success = $true
+              } catch {
+                  Write-Warning "Download failed: $($_.Exception.Message)"
+                  $retryCount++
+                  if ($retryCount -lt $maxRetries) { Start-Sleep -Seconds 5 }
+              }
+          }
+          
+          if (-not $success) {
+              Write-Error "Failed to download Tailscale after $maxRetries attempts."
+              exit 1
+          }
+          
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
           # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsExe = Join-Path -Path $env:ProgramFiles -ChildPath "Tailscale\tailscale.exe"
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
           # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $tsIP = & $tsExe ip -4
               Start-Sleep -Seconds 5
               $retries++
           }

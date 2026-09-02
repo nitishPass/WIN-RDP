@@ -137,8 +137,8 @@ jobs:
               $totalRam = [math]::Round($osInfo.TotalVisibleMemorySize / 1MB, 2)
               $ramUsagePercent = [math]::Round((($totalRam - $freeRam) / $totalRam) * 100, 1)
               
-              # 4. Network Keep-Alive (Ping Google DNS via Port 53 since standard ping is blocked)
-              Test-NetConnection -ComputerName 8.8.8.8 -Port 53 -InformationLevel Quiet | Out-Null
+              # 4. Network Keep-Alive (Silent HTTPS request to keep tunnel active without Ping warnings)
+              Invoke-WebRequest -Uri "https://8.8.8.8" -UseBasicParsing -TimeoutSec 3 -ErrorAction SilentlyContinue | Out-Null
               
               # Print the Live Status
               Write-Host "[⌚ $utcStr | 🌍 $istStr] ⏱️ Uptime: $uptimeStr | 📊 CPU: ${cpuLoad}% | 🧠 RAM Used: ${ramUsagePercent}%"

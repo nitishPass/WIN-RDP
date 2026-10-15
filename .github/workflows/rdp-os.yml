@@ -1,0 +1,126 @@
+name: RDP (choose OS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'OS for the remote machine'
+        required: true
+        default: 'windows'
+        type: choice
+        options:
+          - windows
+          - macos
+          - linux
+
+jobs:
+  rdp:
+    runs-on: ${{ inputs.os == 'windows' && 'windows-latest' || inputs.os == 'macos' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 360 # GitHub caps hosted runners at ~6 hours per run
+
+    steps:
+      - name: Check required secrets
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.RDP_USERNAME }}" ] || [ -z "${{ secrets.RDP_PASSWORD }}" ] || [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "::error::Set RDP_USERNAME, RDP_PASSWORD and TAILSCALE_AUTH_KEY in repo secrets first."
+            exit 1
+          fi
+          echo "Secrets present."
+
+      # ---------------- Windows ----------------
+      - name: Configure RDP (Windows)
+        if: inputs.os == 'windows'
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          $securePass = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+          New-LocalUser -Name "${{ secrets.RDP_USERNAME }}" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "${{ secrets.RDP_USERNAME }}"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ secrets.RDP_USERNAME }}"
+          Restart-Service -Name TermService -Force
+
+      - name: Install Tailscale (Windows)
+        if: inputs.os == 'windows'
+        shell: powershell
+        run: |
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Connect Tailscale (Windows)
+        if: inputs.os == 'windows'
+        shell: powershell
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-win-$env:GITHUB_RUN_ID
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 12) { $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; Start-Sleep -Seconds 5; $retries++ }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "RDP target: $tsIP"
+
+      # ---------------- Linux (RDP via xRDP + XFCE) ----------------
+      - name: Install desktop + xRDP (Linux)
+        if: inputs.os == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq xfce4 xfce4-goodies xrdp > /dev/null
+          echo "runner:${{ secrets.RDP_PASSWORD }}" | sudo chpasswd
+          echo "startxfce4" > ~/.xsession
+          sudo systemctl enable --now xrdp
+
+      - name: Install + connect Tailscale (Linux)
+        if: inputs.os == 'linux'
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-linux-$GITHUB_RUN_ID
+          TS_IP=""
+          for i in $(seq 1 12); do TS_IP=$(tailscale ip -4 2>/dev/null); [ -n "$TS_IP" ] && break; sleep 5; done
+          [ -z "$TS_IP" ] && { echo "Tailscale IP not assigned"; exit 1; }
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "RDP target: $TS_IP (username: runner)"
+
+      # ---------------- macOS (VNC via Screen Sharing) - experimental ----------------
+      - name: Enable Screen Sharing (macOS)
+        if: inputs.os == 'macos'
+        run: |
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -privs -all -restart -agent -menu
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "${{ secrets.RDP_PASSWORD }}"
+
+      - name: Install + connect Tailscale (macOS)
+        if: inputs.os == 'macos'
+        run: |
+          brew install -q tailscale
+          sudo tailscaled --tun=userspace-networking > /tmp/tailscaled.log 2>&1 &
+          sleep 8
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-mac-$GITHUB_RUN_ID
+          TS_IP=""
+          for i in $(seq 1 12); do TS_IP=$(sudo tailscale ip -4 2>/dev/null); [ -n "$TS_IP" ] && break; sleep 5; done
+          [ -z "$TS_IP" ] && { echo "Tailscale IP not assigned"; exit 1; }
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "VNC target: $TS_IP:5900 (username: runner)"
+
+      # ---------------- Connection info + keep alive ----------------
+      - name: Show connection info
+        shell: bash
+        run: |
+          echo "=================================="
+          echo " OS:       ${{ inputs.os }}"
+          echo " Address:  $TAILSCALE_IP"
+          if [ "${{ inputs.os }}" = "windows" ]; then
+            echo " Username: ${{ secrets.RDP_USERNAME }}"
+          else
+            echo " Username: runner"
+          fi
+          echo " Password: (your RDP_PASSWORD secret)"
+          echo "=================================="
+
+      - name: Keep alive
+        shell: bash
+        run: |
+          while true; do echo "$(date -u) - session alive"; sleep 300; done
